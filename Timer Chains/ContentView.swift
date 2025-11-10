@@ -14,9 +14,10 @@ struct Activity: Identifiable, Hashable {
     let name: String
     let durationMinutes: Int
     var status: ActivityStatus = .notStarted
+    var remainingSeconds: Int? = nil   // nil means "full duration left"
 }
 
-enum ActivityStatus {
+enum ActivityStatus: Hashable {
     case notStarted
     case inProgress
     case completedToday
@@ -31,7 +32,7 @@ struct ContentView: View {
         Activity(name: "Read a book", durationMinutes: 15)
     ]
     
-    @State private var activeActivity: Activity? = nil           // current running timer
+    @State private var activeActivity: Activity? = nil           // current timer screen
     @State private var pendingStartActivity: Activity? = nil     // for pre-start confirmation
     @State private var showStartConfirmation = false
     @State private var showActiveTimerAlert = false
@@ -39,9 +40,10 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             List {
-                ForEach(activities) { activity in
+                ForEach(sortedActivities) { activity in
                     ActivityRow(
                         activity: activity,
+                        remainingSeconds: remainingSeconds(for: activity),
                         onStartTapped: { startTapped(activity) },
                         onStreakTapped: { streakTapped(activity) }
                     )
@@ -59,7 +61,7 @@ struct ContentView: View {
                 }
                 Button("Cancel", role: .cancel) { }
             } message: { activity in
-                Text("Start \(activity.durationMinutes)-minute timer for “\(activity.name)” now?")
+                Text("Start timer with \(formattedRemainingTime(for: activity)) remaining for “\(activity.name)” now?")
             }
             // Alert if user tries to start a second timer
             .alert("Timer already running", isPresented: $showActiveTimerAlert) {
@@ -81,7 +83,12 @@ struct ContentView: View {
                         activeActivity = nil
                     },
                     onCancel: {
+                        // user explicitly cancels (reset)
                         markActivityNotStarted(activity)
+                        activeActivity = nil
+                    },
+                    onPauseAndExit: { secondsLeft in
+                        saveRemainingTime(for: activity, seconds: secondsLeft)
                         activeActivity = nil
                     }
                 )
@@ -89,11 +96,44 @@ struct ContentView: View {
         }
     }
     
+    // Sorted so unfinished timers appear first, completed at the bottom
+    private var sortedActivities: [Activity] {
+        activities.sorted { lhs, rhs in
+            switch (lhs.status, rhs.status) {
+            case (.completedToday, .completedToday):
+                return lhs.name < rhs.name
+            case (.completedToday, _):
+                return false         // completed goes after not-completed
+            case (_, .completedToday):
+                return true          // not-completed goes before completed
+            default:
+                return lhs.name < rhs.name
+            }
+        }
+    }
+    
+    // MARK: - Remaining time helpers
+    
+    private func remainingSeconds(for activity: Activity) -> Int {
+        let base = activity.remainingSeconds ?? activity.durationMinutes * 60
+        return max(base, 0)
+    }
+    
+    private func formattedRemainingTime(for activity: Activity) -> String {
+        formattedTime(seconds: remainingSeconds(for: activity))
+    }
+    
+    private func formattedTime(seconds: Int) -> String {
+        let minutes = seconds / 60
+        let secs = seconds % 60
+        return String(format: "%02d:%02d", minutes, secs)
+    }
+    
     // MARK: - Actions
     
     private func startTapped(_ activity: Activity) {
         if activeActivity != nil {
-            // A timer is already running
+            // A timer is already running (on the timer screen)
             showActiveTimerAlert = true
         } else {
             pendingStartActivity = activity
@@ -107,21 +147,38 @@ struct ContentView: View {
     }
     
     private func actuallyStartTimer(_ activity: Activity) {
-        updateStatus(for: activity, to: .inProgress)
-        activeActivity = activity
+        // Ensure we update the version in our array, including remainingSeconds
+        guard let index = activities.firstIndex(where: { $0.id == activity.id }) else { return }
+        
+        // If this is the first time starting, set remainingSeconds to full duration
+        if activities[index].remainingSeconds == nil {
+            activities[index].remainingSeconds = activities[index].durationMinutes * 60
+        }
+        
+        activities[index].status = .inProgress
+        
+        // Use the updated activity (with remainingSeconds) for the timer screen
+        activeActivity = activities[index]
     }
     
     private func markActivityCompletedToday(_ activity: Activity) {
-        updateStatus(for: activity, to: .completedToday)
+        if let index = activities.firstIndex(where: { $0.id == activity.id }) {
+            activities[index].status = .completedToday
+            activities[index].remainingSeconds = nil
+        }
     }
     
     private func markActivityNotStarted(_ activity: Activity) {
-        updateStatus(for: activity, to: .notStarted)
+        if let index = activities.firstIndex(where: { $0.id == activity.id }) {
+            activities[index].status = .notStarted
+            activities[index].remainingSeconds = nil
+        }
     }
     
-    private func updateStatus(for activity: Activity, to newStatus: ActivityStatus) {
+    private func saveRemainingTime(for activity: Activity, seconds: Int) {
         if let index = activities.firstIndex(where: { $0.id == activity.id }) {
-            activities[index].status = newStatus
+            activities[index].remainingSeconds = seconds
+            activities[index].status = .inProgress
         }
     }
 }
@@ -130,6 +187,7 @@ struct ContentView: View {
 
 struct ActivityRow: View {
     let activity: Activity
+    let remainingSeconds: Int
     let onStartTapped: () -> Void
     let onStreakTapped: () -> Void
     
@@ -139,7 +197,7 @@ struct ActivityRow: View {
                 Text(activity.name)
                     .font(.headline)
                 
-                Text("\(activity.durationMinutes) minutes • \(statusText)")
+                Text("\(formattedRemaining) remaining • \(statusText)")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -169,6 +227,12 @@ struct ActivityRow: View {
             return "Completed today"
         }
     }
+    
+    private var formattedRemaining: String {
+        let minutes = remainingSeconds / 60
+        let secs = remainingSeconds % 60
+        return String(format: "%02d:%02d", minutes, secs)
+    }
 }
 
 // MARK: - Timer Screen
@@ -176,18 +240,28 @@ struct ActivityRow: View {
 struct TimerView: View {
     let activity: Activity
     let onFinish: (Bool) -> Void      // true = user confirmed they did it
-    let onCancel: () -> Void
+    let onCancel: () -> Void          // user explicitly cancels
+    let onPauseAndExit: (Int) -> Void // user pauses then goes back to list
     
     @State private var remainingSeconds: Int
     @State private var isRunning: Bool = true
     @State private var timer: Timer?
     @State private var showCompletionConfirm = false
     
-    init(activity: Activity, onFinish: @escaping (Bool) -> Void, onCancel: @escaping () -> Void) {
+    init(
+        activity: Activity,
+        onFinish: @escaping (Bool) -> Void,
+        onCancel: @escaping () -> Void,
+        onPauseAndExit: @escaping (Int) -> Void
+    ) {
         self.activity = activity
         self.onFinish = onFinish
         self.onCancel = onCancel
-        _remainingSeconds = State(initialValue: activity.durationMinutes * 60)
+        self.onPauseAndExit = onPauseAndExit
+        
+        // Use saved remainingSeconds if present, otherwise full duration
+        let initialSeconds = activity.remainingSeconds ?? activity.durationMinutes * 60
+        _remainingSeconds = State(initialValue: initialSeconds)
     }
     
     var body: some View {
@@ -216,7 +290,17 @@ struct TimerView: View {
         }
         .padding()
         .navigationTitle("Timer")
-        .navigationBarBackButtonHidden(true) // must cancel or finish
+        .navigationBarBackButtonHidden(true) // we manage back behavior ourselves
+        .toolbar {
+            // When paused, allow going back to the list while preserving remaining time
+            if !isRunning {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Back") {
+                        backToList()
+                    }
+                }
+            }
+        }
         .onAppear {
             startTimer()
         }
@@ -265,21 +349,28 @@ struct TimerView: View {
         onCancel()
     }
     
+    private func backToList() {
+        timer?.invalidate()
+        // Save remaining time, keep status as inProgress
+        onPauseAndExit(remainingSeconds)
+    }
+    
     private var formattedTime: String {
         let minutes = remainingSeconds / 60
-        let seconds = remainingSeconds % 60
-        return String(format: "%02d:%02d", minutes, seconds)
+        let secs = remainingSeconds % 60
+        return String(format: "%02d:%02d", minutes, secs)
     }
 }
 
-//// MARK: - Preview
+// MARK: - Preview
 //
 //struct ContentView_Previews: PreviewProvider {
 //    static var previews: some View {
 //        ContentView()
 //    }
 //}
-
+//
+//
 
 
 #Preview {
