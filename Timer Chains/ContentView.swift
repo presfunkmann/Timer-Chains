@@ -68,7 +68,8 @@ struct ContentView: View {
                         activity: activity,
                         remainingSeconds: remainingSeconds(for: activity),
                         onStartTapped: { startTapped(activity) },
-                        onStreakTapped: { streakTapped(activity) }
+                        onStreakTapped: { streakTapped(activity) },
+                        onDeleteTapped: { deleteActivity(activity) }
                     )
                 }
             }
@@ -181,6 +182,10 @@ struct ContentView: View {
     }
     
     // MARK: - Actions
+    private func deleteActivity(_ activity: Activity) {
+        cancelNotification(for: activity)
+        modelContext.delete(activity)
+    }
     
     private func startTapped(_ activity: Activity) {
         if activeActivity != nil {
@@ -273,6 +278,7 @@ struct ActivityRow: View {
     let remainingSeconds: Int
     let onStartTapped: () -> Void
     let onStreakTapped: () -> Void
+    let onDeleteTapped: () -> Void
     
     var body: some View {
         HStack {
@@ -298,6 +304,13 @@ struct ActivityRow: View {
             .buttonStyle(.borderedProminent)
         }
         .padding(.vertical, 4)
+        .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+                onDeleteTapped()
+            } label: {
+                Text("Delete")
+            }
+        }
     }
     
     private var statusText: String {
