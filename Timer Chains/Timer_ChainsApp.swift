@@ -14,6 +14,6 @@ struct YourProjectNameApp: App {
         WindowGroup {
             ContentView()
         }
-        .modelContainer(for: Activity.self)
+        .modelContainer(for: [Activity.self, ActivityCompletion.self])
     }
 }

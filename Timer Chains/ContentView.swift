@@ -9,7 +9,7 @@ import SwiftUI
 import SwiftData
 import UserNotifications
 
-// MARK: - SwiftData Model
+// MARK: - SwiftData Models
 
 @Model
 final class Activity: Identifiable, Hashable {
@@ -17,6 +17,7 @@ final class Activity: Identifiable, Hashable {
     var name: String
     /// Currently treated as **seconds** for testing.
     var durationMinutes: Int
+    /// Whether this activity has a completion entry for *today*.
     var isCompletedToday: Bool
     /// Used when paused (how many seconds are left) or before first start.
     var remainingSeconds: Int?
@@ -38,7 +39,7 @@ final class Activity: Identifiable, Hashable {
         self.targetEndDate = targetEndDate
     }
     
-    // Hashable conformance (use id)
+    // Hashable via id
     static func == (lhs: Activity, rhs: Activity) -> Bool {
         lhs.id == rhs.id
     }
@@ -48,17 +49,35 @@ final class Activity: Identifiable, Hashable {
     }
 }
 
+/// One "I completed this activity on this calendar day" record.
+@Model
+final class ActivityCompletion {
+    @Attribute(.unique) var id: UUID
+    var activity: Activity
+    /// Always stored as startOfDay in the current calendar.
+    var date: Date
+    
+    init(activity: Activity, date: Date) {
+        self.id = UUID()
+        let calendar = Calendar.current
+        self.activity = activity
+        self.date = calendar.startOfDay(for: date)
+    }
+}
+
 // MARK: - Main Screen
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var activities: [Activity]
+    @Query private var completions: [ActivityCompletion]
     
     @State private var activeActivity: Activity? = nil           // current timer screen
     @State private var pendingStartActivity: Activity? = nil     // for pre-start confirmation
     @State private var showStartConfirmation = false
     @State private var showActiveTimerAlert = false
     @State private var showingAddTimerSheet = false
+    @State private var streakActivity: Activity? = nil           // for streak sheet
     
     var body: some View {
         NavigationStack {
@@ -85,6 +104,7 @@ struct ContentView: View {
             }
             .onAppear {
                 requestNotificationPermission()
+                syncCompletedTodayFromCompletions()
             }
             // Confirm before starting a timer
             .alert(
@@ -126,7 +146,7 @@ struct ContentView: View {
                         activeActivity = nil
                     },
                     onPauseAndExit: { secondsLeft in
-                        // paused; save remaining time but keep inProgress
+                        // paused; save remaining time but keep in-progress
                         saveRemainingTime(for: activity, seconds: secondsLeft)
                         cancelNotification(for: activity)
                         activeActivity = nil
@@ -135,6 +155,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showingAddTimerSheet) {
                 AddActivitySheet()
+            }
+            .sheet(item: $streakActivity) { activity in
+                StreakView(activity: activity)
             }
         }
     }
@@ -182,10 +205,6 @@ struct ContentView: View {
     }
     
     // MARK: - Actions
-    private func deleteActivity(_ activity: Activity) {
-        cancelNotification(for: activity)
-        modelContext.delete(activity)
-    }
     
     private func startTapped(_ activity: Activity) {
         if activeActivity != nil {
@@ -198,8 +217,12 @@ struct ContentView: View {
     }
     
     private func streakTapped(_ activity: Activity) {
-        print("Streak tapped for \(activity.name)")
-        // later: navigate to a streak visualization screen
+        streakActivity = activity
+    }
+    
+    private func deleteActivity(_ activity: Activity) {
+        cancelNotification(for: activity)
+        modelContext.delete(activity)
     }
     
     private func actuallyStartTimer(_ activity: Activity) {
@@ -218,6 +241,16 @@ struct ContentView: View {
     }
     
     private func markActivityCompletedToday(_ activity: Activity) {
+        // Record completion for today (normalized to start-of-day)
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        
+        // Avoid duplicate completion entries for the same (activity, date)
+        if !completions.contains(where: { $0.activity.id == activity.id && $0.date == today }) {
+            let completion = ActivityCompletion(activity: activity, date: today)
+            modelContext.insert(completion)
+        }
+        
         activity.isCompletedToday = true
         activity.remainingSeconds = nil
         activity.targetEndDate = nil
@@ -225,6 +258,7 @@ struct ContentView: View {
     }
     
     private func markActivityNotStarted(_ activity: Activity) {
+        // Do not touch existing completions here (so past days are preserved)
         activity.isCompletedToday = false
         activity.remainingSeconds = nil
         activity.targetEndDate = nil
@@ -235,6 +269,19 @@ struct ContentView: View {
         activity.remainingSeconds = seconds
         activity.targetEndDate = nil   // not running while paused
         activity.isCompletedToday = false
+    }
+    
+    /// Sync isCompletedToday flags from the completions table for the current date.
+    private func syncCompletedTodayFromCompletions() {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        
+        for activity in activities {
+            let hasToday = completions.contains { completion in
+                completion.activity.id == activity.id && completion.date == today
+            }
+            activity.isCompletedToday = hasToday
+        }
     }
     
     // MARK: - Notifications
@@ -304,10 +351,10 @@ struct ActivityRow: View {
             .buttonStyle(.borderedProminent)
         }
         .padding(.vertical, 4)
-        .swipeActions(edge: .trailing) {
-            Button(role: .destructive) {
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive, action: {
                 onDeleteTapped()
-            } label: {
+            }) {
                 Text("Delete")
             }
         }
@@ -317,6 +364,8 @@ struct ActivityRow: View {
         if activity.isCompletedToday {
             return "Completed today"
         } else if remainingSeconds < activity.durationMinutes {
+            // There is less time left than the original duration,
+            // so the user has started (or paused) this timer.
             return "In progress"
         } else {
             return "Not started"
@@ -525,13 +574,119 @@ struct TimerView: View {
     }
 }
 
+// MARK: - Streak View
+
+struct StreakView: View {
+    let activity: Activity
+    
+    @Environment(\.modelContext) private var modelContext
+    @State private var completions: [ActivityCompletion] = []
+    
+    private var calendar: Calendar { Calendar.current }
+    
+    private var today: Date {
+        calendar.startOfDay(for: Date())
+    }
+    
+    private var completionDatesSet: Set<Date> {
+        Set(completions.map { calendar.startOfDay(for: $0.date) })
+    }
+    
+    /// Number of consecutive days ending today with a completion.
+    private var streakCount: Int {
+        var count = 0
+        var day = today
+        
+        while completionDatesSet.contains(day) {
+            count += 1
+            guard let prev = calendar.date(byAdding: .day, value: -1, to: day) else { break }
+            day = calendar.startOfDay(for: prev)
+        }
+        
+        return count
+    }
+    
+    /// Last 14 days (including today), oldest -> newest.
+    private var last14Days: [Date] {
+        (0..<14).compactMap { offset in
+            calendar.date(byAdding: .day, value: -offset, to: today)
+        }
+        .map { calendar.startOfDay(for: $0) }
+        .sorted()
+    }
+    
+    var body: some View {
+        VStack(spacing: 24) {
+            Text(activity.name)
+                .font(.title2)
+                .multilineTextAlignment(.center)
+            
+            Text("Current streak: \(streakCount) day\(streakCount == 1 ? "" : "s")")
+                .font(.headline)
+            
+            // Simple chain visualization for last 14 days
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(last14Days, id: \.self) { day in
+                        let isDone = completionDatesSet.contains(day)
+                        VStack(spacing: 4) {
+                            ZStack {
+                                Circle()
+                                    .strokeBorder(lineWidth: 2)
+                                    .frame(width: 24, height: 24)
+                                    .opacity(isDone ? 1.0 : 0.4)
+                                
+                                if isDone {
+                                    Circle()
+                                        .frame(width: 18, height: 18)
+                                }
+                            }
+                            
+                            Text(shortDayLabel(for: day))
+                                .font(.caption2)
+                        }
+                    }
+                }
+                .padding(.horizontal)
+            }
+            
+            Spacer()
+        }
+        .padding()
+        .navigationTitle("Streak")
+        .onAppear {
+            loadCompletions()
+        }
+    }
+    
+    private func loadCompletions() {
+        let descriptor = FetchDescriptor<ActivityCompletion>()
+        
+        if let results = try? modelContext.fetch(descriptor) {
+            // Only keep completions for this activity
+            completions = results.filter { $0.activity.id == activity.id }
+        }
+    }
+
+    
+    private func shortDayLabel(for date: Date) -> String {
+        if calendar.isDateInToday(date) {
+            return "Today"
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "E" // Mon, Tue, etc.
+        return formatter.string(from: date)
+    }
+}
+
 // MARK: - Preview
-//
+
 //struct ContentView_Previews: PreviewProvider {
 //    static var previews: some View {
 //        ContentView()
 //    }
 //}
+
 
 
 
