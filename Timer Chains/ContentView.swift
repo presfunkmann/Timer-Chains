@@ -189,8 +189,7 @@ struct ContentView: View {
             // Paused or prepared but not started
             return max(stored, 0)
         } else {
-            // Fresh: treat durationMinutes as *seconds* for testing
-            return max(activity.durationMinutes, 0)
+            return max(activity.durationMinutes * 60, 0)
         }
     }
     
@@ -363,7 +362,7 @@ struct ActivityRow: View {
     private var statusText: String {
         if activity.isCompletedToday {
             return "Completed today"
-        } else if remainingSeconds < activity.durationMinutes {
+        } else if remainingSeconds < activity.durationMinutes * 60 {
             // There is less time left than the original duration,
             // so the user has started (or paused) this timer.
             return "In progress"
@@ -394,7 +393,7 @@ struct AddActivitySheet: View {
                 Section("Timer") {
                     TextField("Name", text: $name)
                     
-                    TextField("Duration (seconds for now)", text: $durationText)
+                    TextField("Duration (minutes)", text: $durationText)
                         .keyboardType(.numberPad)
                 }
             }
@@ -422,8 +421,11 @@ struct AddActivitySheet: View {
     }
     
     private func save() {
-        guard let seconds = Int(durationText), seconds > 0 else { return }
-        let activity = Activity(name: name.trimmingCharacters(in: .whitespaces), durationMinutes: seconds)
+        guard let minutes = Int(durationText), minutes > 0 else { return }
+        let activity = Activity(
+            name: name.trimmingCharacters(in: .whitespaces),
+            durationMinutes: minutes
+        )
         modelContext.insert(activity)
         dismiss()
     }
@@ -512,7 +514,7 @@ struct TimerView: View {
                 onFinish(false)
             }
         } message: {
-            Text("Did you actually do “\(activity.name)” for \(activity.durationMinutes) seconds?")
+            Text("Did you actually do “\(activity.name)” for \(activity.durationMinutes) minutes?")
         }
     }
     
