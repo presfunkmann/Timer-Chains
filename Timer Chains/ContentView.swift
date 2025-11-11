@@ -6,38 +6,59 @@
 //
 
 import SwiftUI
+import SwiftData
 import UserNotifications
 
-// MARK: - Models
+// MARK: - SwiftData Model
 
-struct Activity: Identifiable, Hashable {
-    let id = UUID()
-    let name: String
-    let durationMinutes: Int          // currently treated as *seconds* for testing
-    var status: ActivityStatus = .notStarted
-    var remainingSeconds: Int? = nil  // used when paused or not yet started
-    var targetEndDate: Date? = nil    // non-nil when actively running
-}
-
-enum ActivityStatus: Hashable {
-    case notStarted
-    case inProgress
-    case completedToday
+@Model
+final class Activity: Identifiable, Hashable {
+    @Attribute(.unique) var id: UUID
+    var name: String
+    /// Currently treated as **seconds** for testing.
+    var durationMinutes: Int
+    var isCompletedToday: Bool
+    /// Used when paused (how many seconds are left) or before first start.
+    var remainingSeconds: Int?
+    /// Non-nil when actively running.
+    var targetEndDate: Date?
+    
+    init(
+        name: String,
+        durationMinutes: Int,
+        isCompletedToday: Bool = false,
+        remainingSeconds: Int? = nil,
+        targetEndDate: Date? = nil
+    ) {
+        self.id = UUID()
+        self.name = name
+        self.durationMinutes = durationMinutes
+        self.isCompletedToday = isCompletedToday
+        self.remainingSeconds = remainingSeconds
+        self.targetEndDate = targetEndDate
+    }
+    
+    // Hashable conformance (use id)
+    static func == (lhs: Activity, rhs: Activity) -> Bool {
+        lhs.id == rhs.id
+    }
+    
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
 }
 
 // MARK: - Main Screen
 
 struct ContentView: View {
-    @State private var activities: [Activity] = [
-        Activity(name: "Study programming", durationMinutes: 5),
-        Activity(name: "Exercise", durationMinutes: 10),
-        Activity(name: "Read a book", durationMinutes: 15)
-    ]
+    @Environment(\.modelContext) private var modelContext
+    @Query private var activities: [Activity]
     
     @State private var activeActivity: Activity? = nil           // current timer screen
     @State private var pendingStartActivity: Activity? = nil     // for pre-start confirmation
     @State private var showStartConfirmation = false
     @State private var showActiveTimerAlert = false
+    @State private var showingAddTimerSheet = false
     
     var body: some View {
         NavigationStack {
@@ -52,6 +73,15 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Timers")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: {
+                        showingAddTimerSheet = true
+                    }) {
+                        Image(systemName: "plus")
+                    }
+                }
+            }
             .onAppear {
                 requestNotificationPermission()
             }
@@ -102,20 +132,23 @@ struct ContentView: View {
                     }
                 )
             }
+            .sheet(isPresented: $showingAddTimerSheet) {
+                AddActivitySheet()
+            }
         }
     }
     
     // Sorted so unfinished timers appear first, completed at the bottom
     private var sortedActivities: [Activity] {
         activities.sorted { lhs, rhs in
-            switch (lhs.status, rhs.status) {
-            case (.completedToday, .completedToday):
+            switch (lhs.isCompletedToday, rhs.isCompletedToday) {
+            case (true, true):
                 return lhs.name < rhs.name
-            case (.completedToday, _):
-                return false         // completed goes after not-completed
-            case (_, .completedToday):
-                return true          // not-completed goes before completed
-            default:
+            case (true, false):
+                return false   // completed goes after not-completed
+            case (false, true):
+                return true    // not-completed goes before completed
+            case (false, false):
                 return lhs.name < rhs.name
             }
         }
@@ -165,47 +198,38 @@ struct ContentView: View {
     }
     
     private func actuallyStartTimer(_ activity: Activity) {
-        guard let index = activities.firstIndex(where: { $0.id == activity.id }) else { return }
-        
         // Determine how much time is left for this activity
-        let secondsLeft = remainingSeconds(for: activities[index])
+        let secondsLeft = remainingSeconds(for: activity)
         
         // Set a new absolute end date based on "now + secondsLeft"
         let endDate = Date().addingTimeInterval(TimeInterval(secondsLeft))
         
-        activities[index].status = .inProgress
-        activities[index].targetEndDate = endDate
-        activities[index].remainingSeconds = nil
+        activity.isCompletedToday = false
+        activity.targetEndDate = endDate
+        activity.remainingSeconds = nil
         
-        let updated = activities[index]
-        scheduleNotification(for: updated, endDate: endDate)
-        activeActivity = updated
+        scheduleNotification(for: activity, endDate: endDate)
+        activeActivity = activity
     }
     
     private func markActivityCompletedToday(_ activity: Activity) {
-        if let index = activities.firstIndex(where: { $0.id == activity.id }) {
-            activities[index].status = .completedToday
-            activities[index].remainingSeconds = nil
-            activities[index].targetEndDate = nil
-        }
+        activity.isCompletedToday = true
+        activity.remainingSeconds = nil
+        activity.targetEndDate = nil
         cancelNotification(for: activity)
     }
     
     private func markActivityNotStarted(_ activity: Activity) {
-        if let index = activities.firstIndex(where: { $0.id == activity.id }) {
-            activities[index].status = .notStarted
-            activities[index].remainingSeconds = nil
-            activities[index].targetEndDate = nil
-        }
+        activity.isCompletedToday = false
+        activity.remainingSeconds = nil
+        activity.targetEndDate = nil
         cancelNotification(for: activity)
     }
     
     private func saveRemainingTime(for activity: Activity, seconds: Int) {
-        if let index = activities.firstIndex(where: { $0.id == activity.id }) {
-            activities[index].remainingSeconds = seconds
-            activities[index].targetEndDate = nil   // not running while paused
-            activities[index].status = .inProgress
-        }
+        activity.remainingSeconds = seconds
+        activity.targetEndDate = nil   // not running while paused
+        activity.isCompletedToday = false
     }
     
     // MARK: - Notifications
@@ -277,13 +301,12 @@ struct ActivityRow: View {
     }
     
     private var statusText: String {
-        switch activity.status {
-        case .notStarted:
-            return "Not started"
-        case .inProgress:
-            return "In progress"
-        case .completedToday:
+        if activity.isCompletedToday {
             return "Completed today"
+        } else if remainingSeconds < activity.durationMinutes {
+            return "In progress"
+        } else {
+            return "Not started"
         }
     }
     
@@ -291,6 +314,56 @@ struct ActivityRow: View {
         let minutes = remainingSeconds / 60
         let secs = remainingSeconds % 60
         return String(format: "%02d:%02d", minutes, secs)
+    }
+}
+
+// MARK: - Add Timer Sheet
+
+struct AddActivitySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+    
+    @State private var name: String = ""
+    @State private var durationText: String = ""
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Timer") {
+                    TextField("Name", text: $name)
+                    
+                    TextField("Duration (seconds for now)", text: $durationText)
+                        .keyboardType(.numberPad)
+                }
+            }
+            .navigationTitle("New Timer")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+    
+    private var canSave: Bool {
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard Int(durationText) ?? 0 > 0 else { return false }
+        return true
+    }
+    
+    private func save() {
+        guard let seconds = Int(durationText), seconds > 0 else { return }
+        let activity = Activity(name: name.trimmingCharacters(in: .whitespaces), durationMinutes: seconds)
+        modelContext.insert(activity)
+        dismiss()
     }
 }
 
@@ -377,7 +450,7 @@ struct TimerView: View {
                 onFinish(false)
             }
         } message: {
-            Text("Did you actually do “\(activity.name)” for \(initialRemainingSeconds) seconds?")
+            Text("Did you actually do “\(activity.name)” for \(activity.durationMinutes) seconds?")
         }
     }
     
@@ -407,7 +480,7 @@ struct TimerView: View {
     
     private func toggleRunning() {
         if isRunning {
-            // going from running -> paused
+            // running -> paused
             if let end = localEndDate {
                 let secsLeft = max(Int(end.timeIntervalSinceNow), 0)
                 remainingSeconds = secsLeft
@@ -428,7 +501,7 @@ struct TimerView: View {
     
     private func backToList() {
         timer?.invalidate()
-        // Save remaining time, keep status as inProgress
+        // Save remaining time, keep status as in-progress
         onPauseAndExit(remainingSeconds)
     }
     
@@ -440,12 +513,13 @@ struct TimerView: View {
 }
 
 // MARK: - Preview
-
+//
 //struct ContentView_Previews: PreviewProvider {
 //    static var previews: some View {
 //        ContentView()
 //    }
 //}
+
 
 
 
