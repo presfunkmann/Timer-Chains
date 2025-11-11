@@ -608,13 +608,44 @@ struct StreakView: View {
         return count
     }
     
-    /// Last 14 days (including today), oldest -> newest.
-    private var last14Days: [Date] {
-        (0..<14).compactMap { offset in
-            calendar.date(byAdding: .day, value: -offset, to: today)
+    /// All days from first completion up to today (or just today if none).
+    private var allDays: [Date] {
+        // If no completions, show just today
+        guard !completions.isEmpty else {
+            return [today]
         }
-        .map { calendar.startOfDay(for: $0) }
-        .sorted()
+        
+        // Earliest completion date (normalized to start-of-day)
+        let earliest = completions
+            .map { calendar.startOfDay(for: $0.date) }
+            .min() ?? today
+        
+        var days: [Date] = []
+        var day = earliest
+        
+        while day <= today {
+            days.append(day)
+            guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+            day = calendar.startOfDay(for: next)
+        }
+        
+        return days
+    }
+    
+    /// Chunk allDays into rows of up to 7 days each.
+    private var rows: [[Date]] {
+        let chunkSize = 7
+        var result: [[Date]] = []
+        let days = allDays
+        
+        var index = 0
+        while index < days.count {
+            let end = min(index + chunkSize, days.count)
+            result.append(Array(days[index..<end]))
+            index = end
+        }
+        
+        return result
     }
     
     var body: some View {
@@ -626,30 +657,23 @@ struct StreakView: View {
             Text("Current streak: \(streakCount) day\(streakCount == 1 ? "" : "s")")
                 .font(.headline)
             
-            // Simple chain visualization for last 14 days
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(last14Days, id: \.self) { day in
-                        let isDone = completionDatesSet.contains(day)
-                        VStack(spacing: 4) {
-                            ZStack {
-                                Circle()
-                                    .strokeBorder(lineWidth: 2)
-                                    .frame(width: 24, height: 24)
-                                    .opacity(isDone ? 1.0 : 0.4)
-                                
-                                if isDone {
-                                    Circle()
-                                        .frame(width: 18, height: 18)
-                                }
-                            }
-                            
-                            Text(shortDayLabel(for: day))
-                                .font(.caption2)
+            // Full-history grid, scrollable vertically, with connectors
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                        rowView(for: row)
+                            .padding(.horizontal)
+                        
+                        // Curved connector from this row to the next, if needed
+                        if index < rows.count - 1 {
+                            interRowConnector(
+                                previousRow: row,
+                                nextRow: rows[index + 1]
+                            )
+                            .padding(.horizontal)
                         }
                     }
                 }
-                .padding(.horizontal)
             }
             
             Spacer()
@@ -661,25 +685,129 @@ struct StreakView: View {
         }
     }
     
+    // MARK: - Row + Cells
+    
+    private func rowView(for row: [Date]) -> some View {
+        // Constants to keep sizing consistent
+        let dotSize: CGFloat = 24
+        let connectorWidth: CGFloat = 16
+        
+        return HStack(spacing: 0) {
+            ForEach(0..<row.count, id: \.self) { index in
+                let day = row[index]
+                let isDone = completionDatesSet.contains(day)
+                
+                VStack(spacing: 4) {
+                    ZStack {
+                        Circle()
+                            .strokeBorder(lineWidth: 2)
+                            .frame(width: dotSize, height: dotSize)
+                            .opacity(isDone ? 1.0 : 0.3)
+                        
+                        if isDone {
+                            Circle()
+                                .frame(width: dotSize - 6, height: dotSize - 6)
+                        }
+                    }
+                    
+                    Text(dateLabel(for: day))
+                        .font(.caption2)
+                }
+                .frame(width: dotSize + 4) // a little breathing room
+                
+                // Horizontal connector to the next day in the same row
+                if index < row.count - 1 {
+                    let nextDay = row[index + 1]
+                    let nextIsDone = completionDatesSet.contains(nextDay)
+                    let isConsecutive = isNextDay(day, nextDay)
+                    let shouldConnect = isDone && nextIsDone && isConsecutive
+                    
+                    Rectangle()
+                        .frame(width: connectorWidth, height: 2)
+                        .opacity(shouldConnect ? 1.0 : 0.1)
+                }
+            }
+        }
+    }
+    
+    /// Curved connector between the last dot of previousRow and the first dot of nextRow
+    @ViewBuilder
+    private func interRowConnector(previousRow: [Date], nextRow: [Date]) -> some View {
+        if let last = previousRow.last,
+           let first = nextRow.first {
+            
+            let lastDone = completionDatesSet.contains(last)
+            let firstDone = completionDatesSet.contains(first)
+            let consecutive = isNextDay(last, first)
+            let shouldConnect = lastDone && firstDone && consecutive
+            
+            if shouldConnect {
+                RowWrapConnectorView()
+            } else {
+                EmptyView()
+            }
+        } else {
+            // No last/first day — nothing to connect
+            EmptyView()
+        }
+    }
+    
+    // MARK: - Data loading & helpers
+    
     private func loadCompletions() {
         let descriptor = FetchDescriptor<ActivityCompletion>()
         
         if let results = try? modelContext.fetch(descriptor) {
-            // Only keep completions for this activity
             completions = results.filter { $0.activity.id == activity.id }
         }
     }
-
     
-    private func shortDayLabel(for date: Date) -> String {
-        if calendar.isDateInToday(date) {
-            return "Today"
+    /// Format as M/D with no leading zeros on either.
+    private func dateLabel(for date: Date) -> String {
+        let comps = calendar.dateComponents([.month, .day], from: date)
+        let month = comps.month ?? 0
+        let day = comps.day ?? 0
+        return "\(month)/\(day)"
+    }
+    
+    /// True if `b` is exactly one day after `a`.
+    private func isNextDay(_ a: Date, _ b: Date) -> Bool {
+        let startA = calendar.startOfDay(for: a)
+        let startB = calendar.startOfDay(for: b)
+        guard let next = calendar.date(byAdding: .day, value: 1, to: startA) else {
+            return false
         }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "E" // Mon, Tue, etc.
-        return formatter.string(from: date)
+        return calendar.isDate(startB, inSameDayAs: next)
     }
 }
+
+// MARK: - Row wrap curved connector
+
+struct RowWrapConnectorView: View {
+    private let lineWidth: CGFloat = 2.0
+    
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let height = geo.size.height
+            
+            Path { path in
+                // Start near the right side, top
+                let start = CGPoint(x: width - 30, y: 0)
+                // End near the left side, bottom
+                let end = CGPoint(x: 30, y: height)
+                // Control point below mid to create a nice curve
+                let control = CGPoint(x: width / 2, y: height + 16)
+                
+                path.move(to: start)
+                path.addQuadCurve(to: end, control: control)
+            }
+            .stroke(lineWidth: lineWidth)
+        }
+        .frame(height: 32) // height of the curved connector space
+    }
+}
+
 
 // MARK: - Preview
 
