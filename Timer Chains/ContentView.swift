@@ -6,15 +6,17 @@
 //
 
 import SwiftUI
+import UserNotifications
 
 // MARK: - Models
 
 struct Activity: Identifiable, Hashable {
     let id = UUID()
     let name: String
-    let durationMinutes: Int
+    let durationMinutes: Int          // currently treated as *seconds* for testing
     var status: ActivityStatus = .notStarted
-    var remainingSeconds: Int? = nil   // nil means "full duration left"
+    var remainingSeconds: Int? = nil  // used when paused or not yet started
+    var targetEndDate: Date? = nil    // non-nil when actively running
 }
 
 enum ActivityStatus: Hashable {
@@ -27,8 +29,8 @@ enum ActivityStatus: Hashable {
 
 struct ContentView: View {
     @State private var activities: [Activity] = [
-        Activity(name: "Study programming", durationMinutes: 1),
-        Activity(name: "Exercise", durationMinutes: 30),
+        Activity(name: "Study programming", durationMinutes: 5),
+        Activity(name: "Exercise", durationMinutes: 10),
         Activity(name: "Read a book", durationMinutes: 15)
     ]
     
@@ -50,6 +52,9 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Timers")
+            .onAppear {
+                requestNotificationPermission()
+            }
             // Confirm before starting a timer
             .alert(
                 "Start timer?",
@@ -73,6 +78,7 @@ struct ContentView: View {
             .navigationDestination(item: $activeActivity) { activity in
                 TimerView(
                     activity: activity,
+                    initialRemainingSeconds: remainingSeconds(for: activity),
                     onFinish: { didConfirm in
                         if didConfirm {
                             markActivityCompletedToday(activity)
@@ -84,11 +90,14 @@ struct ContentView: View {
                     },
                     onCancel: {
                         // user explicitly cancels (reset)
+                        cancelNotification(for: activity)
                         markActivityNotStarted(activity)
                         activeActivity = nil
                     },
                     onPauseAndExit: { secondsLeft in
+                        // paused; save remaining time but keep inProgress
                         saveRemainingTime(for: activity, seconds: secondsLeft)
+                        cancelNotification(for: activity)
                         activeActivity = nil
                     }
                 )
@@ -115,8 +124,17 @@ struct ContentView: View {
     // MARK: - Remaining time helpers
     
     private func remainingSeconds(for activity: Activity) -> Int {
-        let base = activity.remainingSeconds ?? activity.durationMinutes * 60
-        return max(base, 0)
+        if let end = activity.targetEndDate {
+            // When running: compute from absolute end time
+            let diff = Int(end.timeIntervalSinceNow)
+            return max(diff, 0)
+        } else if let stored = activity.remainingSeconds {
+            // Paused or prepared but not started
+            return max(stored, 0)
+        } else {
+            // Fresh: treat durationMinutes as *seconds* for testing
+            return max(activity.durationMinutes, 0)
+        }
     }
     
     private func formattedRemainingTime(for activity: Activity) -> String {
@@ -147,39 +165,80 @@ struct ContentView: View {
     }
     
     private func actuallyStartTimer(_ activity: Activity) {
-        // Ensure we update the version in our array, including remainingSeconds
         guard let index = activities.firstIndex(where: { $0.id == activity.id }) else { return }
         
-        // If this is the first time starting, set remainingSeconds to full duration
-        if activities[index].remainingSeconds == nil {
-            activities[index].remainingSeconds = activities[index].durationMinutes * 60
-        }
+        // Determine how much time is left for this activity
+        let secondsLeft = remainingSeconds(for: activities[index])
+        
+        // Set a new absolute end date based on "now + secondsLeft"
+        let endDate = Date().addingTimeInterval(TimeInterval(secondsLeft))
         
         activities[index].status = .inProgress
+        activities[index].targetEndDate = endDate
+        activities[index].remainingSeconds = nil
         
-        // Use the updated activity (with remainingSeconds) for the timer screen
-        activeActivity = activities[index]
+        let updated = activities[index]
+        scheduleNotification(for: updated, endDate: endDate)
+        activeActivity = updated
     }
     
     private func markActivityCompletedToday(_ activity: Activity) {
         if let index = activities.firstIndex(where: { $0.id == activity.id }) {
             activities[index].status = .completedToday
             activities[index].remainingSeconds = nil
+            activities[index].targetEndDate = nil
         }
+        cancelNotification(for: activity)
     }
     
     private func markActivityNotStarted(_ activity: Activity) {
         if let index = activities.firstIndex(where: { $0.id == activity.id }) {
             activities[index].status = .notStarted
             activities[index].remainingSeconds = nil
+            activities[index].targetEndDate = nil
         }
+        cancelNotification(for: activity)
     }
     
     private func saveRemainingTime(for activity: Activity, seconds: Int) {
         if let index = activities.firstIndex(where: { $0.id == activity.id }) {
             activities[index].remainingSeconds = seconds
+            activities[index].targetEndDate = nil   // not running while paused
             activities[index].status = .inProgress
         }
+    }
+    
+    // MARK: - Notifications
+    
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+                // you could check 'granted' here if you want
+            }
+    }
+    
+    private func scheduleNotification(for activity: Activity, endDate: Date) {
+        let seconds = max(Int(endDate.timeIntervalSinceNow), 0)
+        guard seconds > 0 else { return }
+        
+        let content = UNMutableNotificationContent()
+        content.title = "Timer finished"
+        content.body = "Timer for “\(activity.name)” is done."
+        content.sound = .default
+        
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(seconds), repeats: false)
+        let request = UNNotificationRequest(
+            identifier: activity.id.uuidString,
+            content: content,
+            trigger: trigger
+        )
+        
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+    
+    private func cancelNotification(for activity: Activity) {
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [activity.id.uuidString])
     }
 }
 
@@ -239,6 +298,7 @@ struct ActivityRow: View {
 
 struct TimerView: View {
     let activity: Activity
+    let initialRemainingSeconds: Int
     let onFinish: (Bool) -> Void      // true = user confirmed they did it
     let onCancel: () -> Void          // user explicitly cancels
     let onPauseAndExit: (Int) -> Void // user pauses then goes back to list
@@ -247,21 +307,23 @@ struct TimerView: View {
     @State private var isRunning: Bool = true
     @State private var timer: Timer?
     @State private var showCompletionConfirm = false
+    @State private var localEndDate: Date?
     
     init(
         activity: Activity,
+        initialRemainingSeconds: Int,
         onFinish: @escaping (Bool) -> Void,
         onCancel: @escaping () -> Void,
         onPauseAndExit: @escaping (Int) -> Void
     ) {
         self.activity = activity
+        self.initialRemainingSeconds = initialRemainingSeconds
         self.onFinish = onFinish
         self.onCancel = onCancel
         self.onPauseAndExit = onPauseAndExit
         
-        // Use saved remainingSeconds if present, otherwise full duration
-        let initialSeconds = activity.remainingSeconds ?? activity.durationMinutes * 60
-        _remainingSeconds = State(initialValue: initialSeconds)
+        _remainingSeconds = State(initialValue: max(initialRemainingSeconds, 0))
+        _localEndDate = State(initialValue: activity.targetEndDate)
     }
     
     var body: some View {
@@ -302,7 +364,7 @@ struct TimerView: View {
             }
         }
         .onAppear {
-            startTimer()
+            startTimerIfNeeded()
         }
         .onDisappear {
             timer?.invalidate()
@@ -315,24 +377,27 @@ struct TimerView: View {
                 onFinish(false)
             }
         } message: {
-            Text("Did you actually do “\(activity.name)” for \(activity.durationMinutes) minutes?")
+            Text("Did you actually do “\(activity.name)” for \(initialRemainingSeconds) seconds?")
         }
     }
     
     // MARK: - Timer logic
     
-    private func startTimer() {
-        timer?.invalidate()
-        isRunning = true
+    private func startTimerIfNeeded() {
+        guard timer == nil else { return }
+        
+        if localEndDate == nil {
+            // If we don't have an end date yet, create one from remainingSeconds
+            localEndDate = Date().addingTimeInterval(TimeInterval(remainingSeconds))
+        }
         
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-            guard isRunning else { return }
+            guard isRunning, let end = localEndDate else { return }
             
-            if remainingSeconds > 0 {
-                remainingSeconds -= 1
-            }
+            let secondsLeft = max(Int(end.timeIntervalSinceNow), 0)
+            remainingSeconds = secondsLeft
             
-            if remainingSeconds <= 0 {
+            if secondsLeft <= 0 {
                 timer?.invalidate()
                 isRunning = false
                 showCompletionConfirm = true
@@ -341,7 +406,19 @@ struct TimerView: View {
     }
     
     private func toggleRunning() {
-        isRunning.toggle()
+        if isRunning {
+            // going from running -> paused
+            if let end = localEndDate {
+                let secsLeft = max(Int(end.timeIntervalSinceNow), 0)
+                remainingSeconds = secsLeft
+            }
+            localEndDate = nil
+            isRunning = false
+        } else {
+            // paused -> running
+            localEndDate = Date().addingTimeInterval(TimeInterval(remainingSeconds))
+            isRunning = true
+        }
     }
     
     private func cancelTimer() {
@@ -363,14 +440,14 @@ struct TimerView: View {
 }
 
 // MARK: - Preview
-//
+
 //struct ContentView_Previews: PreviewProvider {
 //    static var previews: some View {
 //        ContentView()
 //    }
 //}
-//
-//
+
+
 
 
 #Preview {
