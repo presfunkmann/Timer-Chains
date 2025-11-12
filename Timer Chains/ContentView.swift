@@ -86,6 +86,7 @@ struct ContentView: View {
                     ActivityRow(
                         activity: activity,
                         remainingSeconds: remainingSeconds(for: activity),
+                        isCompletedToday: isCompletedToday(activity),
                         onStartTapped: { startTapped(activity) },
                         onStreakTapped: { streakTapped(activity) },
                         onDeleteTapped: { deleteActivity(activity) }
@@ -104,7 +105,6 @@ struct ContentView: View {
             }
             .onAppear {
                 requestNotificationPermission()
-                syncCompletedTodayFromCompletions()
             }
             // Confirm before starting a timer
             .alert(
@@ -165,7 +165,10 @@ struct ContentView: View {
     // Sorted so unfinished timers appear first, completed at the bottom
     private var sortedActivities: [Activity] {
         activities.sorted { lhs, rhs in
-            switch (lhs.isCompletedToday, rhs.isCompletedToday) {
+            let lhsDone = isCompletedToday(lhs)
+            let rhsDone = isCompletedToday(rhs)
+            
+            switch (lhsDone, rhsDone) {
             case (true, true):
                 return lhs.name < rhs.name
             case (true, false):
@@ -177,6 +180,7 @@ struct ContentView: View {
             }
         }
     }
+
     
     // MARK: - Remaining time helpers
     
@@ -190,6 +194,8 @@ struct ContentView: View {
             return max(stored, 0)
         } else {
             return max(activity.durationMinutes * 60, 0)
+            // U For Testing 
+//            return max(activity.durationMinutes, 0)
         }
     }
     
@@ -204,6 +210,14 @@ struct ContentView: View {
     }
     
     // MARK: - Actions
+    
+    private func isCompletedToday(_ activity: Activity) -> Bool {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        return completions.contains { completion in
+            completion.activity.id == activity.id && completion.date == today
+        }
+    }
     
     private func startTapped(_ activity: Activity) {
         if activeActivity != nil {
@@ -240,46 +254,37 @@ struct ContentView: View {
     }
     
     private func markActivityCompletedToday(_ activity: Activity) {
-        // Record completion for today (normalized to start-of-day)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         
-        // Avoid duplicate completion entries for the same (activity, date)
+        // Insert a completion record for today if it doesn't exist
         if !completions.contains(where: { $0.activity.id == activity.id && $0.date == today }) {
             let completion = ActivityCompletion(activity: activity, date: today)
             modelContext.insert(completion)
         }
         
-        activity.isCompletedToday = true
-        activity.remainingSeconds = nil
-        activity.targetEndDate = nil
+        // Clear timer-related state on the stored Activity
+        if let existing = activities.first(where: { $0.id == activity.id }) {
+            existing.remainingSeconds = nil
+            existing.targetEndDate = nil
+        }
+        
         cancelNotification(for: activity)
     }
     
     private func markActivityNotStarted(_ activity: Activity) {
-        // Do not touch existing completions here (so past days are preserved)
-        activity.isCompletedToday = false
-        activity.remainingSeconds = nil
-        activity.targetEndDate = nil
+        // Don't touch completion history
+        if let existing = activities.first(where: { $0.id == activity.id }) {
+            existing.remainingSeconds = nil
+            existing.targetEndDate = nil
+        }
         cancelNotification(for: activity)
     }
     
     private func saveRemainingTime(for activity: Activity, seconds: Int) {
-        activity.remainingSeconds = seconds
-        activity.targetEndDate = nil   // not running while paused
-        activity.isCompletedToday = false
-    }
-    
-    /// Sync isCompletedToday flags from the completions table for the current date.
-    private func syncCompletedTodayFromCompletions() {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        
-        for activity in activities {
-            let hasToday = completions.contains { completion in
-                completion.activity.id == activity.id && completion.date == today
-            }
-            activity.isCompletedToday = hasToday
+        if let existing = activities.first(where: { $0.id == activity.id }) {
+            existing.remainingSeconds = seconds
+            existing.targetEndDate = nil   // not running while paused
         }
     }
     
@@ -322,6 +327,7 @@ struct ContentView: View {
 struct ActivityRow: View {
     let activity: Activity
     let remainingSeconds: Int
+    let isCompletedToday: Bool
     let onStartTapped: () -> Void
     let onStreakTapped: () -> Void
     let onDeleteTapped: () -> Void
@@ -360,11 +366,10 @@ struct ActivityRow: View {
     }
     
     private var statusText: String {
-        if activity.isCompletedToday {
+        if isCompletedToday {
             return "Completed today"
         } else if remainingSeconds < activity.durationMinutes * 60 {
-            // There is less time left than the original duration,
-            // so the user has started (or paused) this timer.
+            // Less time left than the original duration → started/paused
             return "In progress"
         } else {
             return "Not started"
@@ -493,7 +498,7 @@ struct TimerView: View {
         .toolbar {
             // When paused, allow going back to the list while preserving remaining time
             if !isRunning {
-                ToolbarItem(placement: .navigationBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button("Back") {
                         backToList()
                     }
